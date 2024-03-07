@@ -1,0 +1,322 @@
+.kubernetes-snippets:
+  use-context:
+    - kubectl config use-context ${KUBERNETES_CONTEXT}
+  check-namespace:
+    - NAMESPACE_STATUS=$((kubectl get namespace "${KUBERNETES_NAMESPACE}" -o json 2>/dev/null || true) | jq .status.phase -r)
+    - >
+      if [ -z ${NAMESPACE_STATUS} ]; then
+        kubectl create namespace ${KUBERNETES_NAMESPACE}
+        echo "Kubernetest Namespace ${KUBERNETES_NAMESPACE} successfully created."
+      elif [ "${NAMESPACE_STATUS}" == "Active" ]; then
+        echo "Kubernetest Namespace ${KUBERNETES_NAMESPACE} exists with status: ${NAMESPACE_STATUS}."
+      else
+        echo "Kubernetest Namespace ${KUBERNETES_NAMESPACE} exists with status: ${NAMESPACE_STATUS}."
+        exit 1
+      fi
+
+.kubernetes-base:
+  before_script:
+    - !reference [.kubernetes-snippets, use-context]
+  image:
+    name: alpine/k8s:1.27.9
+  tags:
+    - gitlab-org-docker
+  variables:
+    KUBERNETES_CONTEXT_BASE: "<YOUR-CONTEXT_BASE>" # Need to fill
+    KUBERNETES_CONTEXT_TAG: "<YOUR-CONTEXT_TAG>" # Need to fill
+    KUBERNETES_CONTEXT: "${KUBERNETES_CONTEXT_BASE}:${KUBERNETES_CONTEXT_TAG}"
+    KUBERNETES_INGRESS_IP_ADDRESS: "<YOUR-INGRESS_IP_ADDRESS>" # Need to fill
+
+.kubernetes-deploy-base:
+  extends: .kubernetes-base
+  variables:
+    DEPLOYMENT_FILE: "./.kubernetes/kubernetestest-deployment.template.yml"
+    SERVICE_FILE: "./.kubernetes/kubernetestest-service.template.yml"
+    INGRESS_FILE: "./.kubernetes/kubernetestest-ingress.template.yml"
+    DEPLOYMENT_POD_ENV_NAME_0: "ASPNETCORE_ENVIRONMENT"
+    DEPLOYMENT_POD_ENV_NAME_1: "PATH_BASE"
+    DEPLOYMENT_DOCKER_REGISTRY_SECRET: "oci-docker-registry-secret"
+    DOCKER_REGISTRY: "<DOCKER_REGISTRY>" # Need to fill
+    DOCKER_REPO: "<DOCKER_REPO>" # Need to fill
+    DOCKER_IMAGE: "${DOCKER_REGISTRY}/${DOCKER_REPO}"
+
+.kubernetes-deploy-production-base:
+  extends: .kubernetes-deploy-base
+  variables:
+    KUBERNETES_NAMESPACE: "kubernetestest-production"
+    DEPLOYMENT_NAME: ""
+    DEPLOYMENT_BLUE_NAME: "kubernetestest-deployment-blue"
+    DEPLOYMENT_GREEN_NAME: "kubernetestest-deployment-green"
+    DEPLOYMENT_REPLICAS: "3"
+    DEPLOYMENT_SELECTOR_NAME: ""
+    DEPLOYMENT_BLUE_SELECTOR_NAME: "kubernetestest-blue"
+    DEPLOYMENT_GREEN_SELECTOR_NAME: "kubernetestest-green"
+    DEPLOYMENT_POD_NAME: "kubernetestest"
+    DEPLOYMENT_POD_IMAGE: "${DOCKER_IMAGE}:${BUILD_VERSION}"
+    DEPLOYMENT_POD_ENV_VALUE_0: "Production"
+    DEPLOYMENT_POD_ENV_VALUE_1: "production;blue;green"
+    SERVICE_NAME: ""
+    SERVICE_BLUE_NAME: "kubernetestest-service-blue"
+    SERVICE_GREEN_NAME: "kubernetestest-service-green"
+    SERVICE_SELECTOR_NAME: ""
+    SERVICE_BLUE_SELECTOR_NAME: "kubernetestest-blue"
+    SERVICE_GREEN_SELECTOR_NAME: "kubernetestest-green"
+    INGRESS_NAME: "kubernetestest-ingress"
+    INGRESS_PATH: "/production"
+    INGRESS_BLUE_PATH: "/blue"
+    INGRESS_GREEN_PATH: "/green"
+
+.kubernetes-deploy-development-base:
+  extends: .kubernetes-deploy-base
+  variables:
+    KUBERNETES_NAMESPACE: "kubernetestest-development"
+    DEPLOYMENT_NAME: "kubernetestest-deployment-${CI_COMMIT_REF_SLUG}"
+    DEPLOYMENT_REPLICAS: "1"
+    DEPLOYMENT_SELECTOR_NAME: "kubernetestest-${CI_COMMIT_REF_SLUG}"
+    DEPLOYMENT_POD_NAME: "kubernetestest"
+    DEPLOYMENT_POD_IMAGE: "${DOCKER_IMAGE}:${CI_COMMIT_REF_SLUG}-${CI_PIPELINE_IID}"
+    DEPLOYMENT_POD_ENV_VALUE_0: "Development"
+    DEPLOYMENT_POD_ENV_VALUE_1: "${CI_COMMIT_REF_SLUG}"
+    SERVICE_NAME: "kubernetestest-service-${CI_COMMIT_REF_SLUG}"
+    SERVICE_SELECTOR_NAME: "kubernetestest-${CI_COMMIT_REF_SLUG}"
+    INGRESS_NAME: "kubernetestest-ingress-${CI_COMMIT_REF_SLUG}"
+    INGRESS_PATH: "/${CI_COMMIT_REF_SLUG}"
+
+kubernetes-deploy-production-blue:
+  extends: .kubernetes-deploy-production-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  stage: deploy
+  needs:
+    - semantic-release
+    - docker-push-production
+  script:
+    - > 
+      if [ -z ${BUILD_VERSION} ]; then
+        echo "Environment variable BUILD_VERSION is null or empty. Do not continue execution"
+        exit 0
+      fi
+    - !reference [.kubernetes-snippets, check-namespace]
+    - BLUE_DEPLOYMENT_STATUS=$((kubectl get deployment "${DEPLOYMENT_BLUE_NAME}" -n "${KUBERNETES_NAMESPACE}" -o json 2>/dev/null || true) | jq ".metadata.annotations.\"bluegreen/live\" // empty" -r)
+    - BLUE_SERVICE_STATUS=$((kubectl get service "${SERVICE_BLUE_NAME}" -n "${KUBERNETES_NAMESPACE}" -o json 2>/dev/null || true) | jq ".metadata.name // empty" -r)
+    - > 
+      if [ -z "${BLUE_DEPLOYMENT_STATUS}" ]; then
+        echo "BLUE_DEPLOYMENT_STATUS is empty. Deployment ${DEPLOYMENT_BLUE_NAME} not found or has no 'bluegreen/live' annotation."
+        chmod +x ./.shell/edit-deployment-with-blue-green-yml.sh && ./.shell/edit-deployment-with-blue-green-yml.sh "blue" "false"
+        kubectl apply -f ${DEPLOYMENT_FILE}
+        BLUE_DEPLOYMENT_STATUS="false"
+      elif [ "${BLUE_DEPLOYMENT_STATUS}" == "false" ]; then
+        echo "Update Image to blue deployment."
+        yq eval "
+          .spec.template.spec.containers[0].name = \"${DEPLOYMENT_POD_NAME}\" |
+          .spec.template.spec.containers[0].image = \"${DEPLOYMENT_POD_IMAGE}\"
+        " -n > ./deployment-blue.yaml
+        cat ./deployment-blue.yaml
+        kubectl patch deployment ${DEPLOYMENT_BLUE_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-blue.yaml
+      fi
+    - > 
+      if [ -z "${BLUE_SERVICE_STATUS}" ]; then
+        echo "BLUE_SERVICE_STATUS is empty. Service ${SERVICE_BLUE_NAME} not found"
+        chmod +x ./.shell/edit-service-with-blue-green-yml.sh && ./.shell/edit-service-with-blue-green-yml.sh "blue"
+        kubectl apply -f ${SERVICE_FILE}
+      fi
+    - echo "BLUE_DEPLOYMENT_STATUS=${BLUE_DEPLOYMENT_STATUS}" >> build.env
+  environment:
+    name: production/blue
+    url: https://${KUBERNETES_INGRESS_IP_ADDRESS}/blue/
+  artifacts:
+    reports:
+      dotenv: build.env
+    
+kubernetes-deploy-production-green:
+  extends: .kubernetes-deploy-production-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  stage: deploy
+  needs:
+    - semantic-release
+    - docker-push-production
+  script:
+    - > 
+      if [ -z ${BUILD_VERSION} ]; then
+        echo "Environment variable BUILD_VERSION is null or empty. Do not continue execution"
+        exit 0
+      fi
+    - !reference [.kubernetes-snippets, check-namespace]
+    - GREEN_DEPLOYMENT_STATUS=$((kubectl get deployment "${DEPLOYMENT_GREEN_NAME}" -n "${KUBERNETES_NAMESPACE}" -o json 2>/dev/null || true) | jq ".metadata.annotations.\"bluegreen/live\" // empty" -r)
+    - GREEN_SERVICE_STATUS=$((kubectl get service "${SERVICE_GREEN_NAME}" -n "${KUBERNETES_NAMESPACE}" -o json 2>/dev/null || true) | jq ".metadata.name // empty" -r)
+    - > 
+      if [ -z "${GREEN_DEPLOYMENT_STATUS}" ]; then
+        echo "GREEN_DEPLOYMENT_STATUS is empty. Deployment ${DEPLOYMENT_GREEN_NAME} not found or has no 'bluegreen/live' annotation."
+        chmod +x ./.shell/edit-deployment-with-blue-green-yml.sh && ./.shell/edit-deployment-with-blue-green-yml.sh "green" "false"
+        kubectl apply -f ${DEPLOYMENT_FILE}
+        GREEN_DEPLOYMENT_STATUS="false"
+      elif [ "${GREEN_DEPLOYMENT_STATUS}" == "false" ]; then
+        echo "Update Image to blue deployment."
+        yq eval "
+          .spec.template.spec.containers[0].name = \"${DEPLOYMENT_POD_NAME}\" |
+          .spec.template.spec.containers[0].image = \"${DEPLOYMENT_POD_IMAGE}\"
+        " -n > ./deployment-green.yaml
+        cat ./deployment-green.yaml
+        kubectl patch deployment ${DEPLOYMENT_GREEN_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-green.yaml
+      fi
+    - > 
+      if [ -z "${GREEN_SERVICE_STATUS}" ]; then
+        echo "GREEN_SERVICE_STATUS is empty. Service ${SERVICE_GREEN_NAME} not found"
+        chmod +x ./.shell/edit-service-with-blue-green-yml.sh && ./.shell/edit-service-with-blue-green-yml.sh "green"
+        kubectl apply -f ${SERVICE_FILE}
+      fi
+    - echo "GREEN_DEPLOYMENT_STATUS=${GREEN_DEPLOYMENT_STATUS}" >> build.env
+  environment:
+    name: production/green
+    url: https://${KUBERNETES_INGRESS_IP_ADDRESS}/green/
+  artifacts:
+    reports:
+      dotenv: build.env
+
+kubernetes-ingress-switch-production:
+  extends: .kubernetes-deploy-production-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  stage: ingress
+  needs:
+    - semantic-release
+    - kubernetes-deploy-production-blue
+    - kubernetes-deploy-production-green
+  script:
+    - > 
+      if [ -z ${BUILD_VERSION} ]; then
+        echo "Environment variable BUILD_VERSION is null or empty. Do not continue execution"
+        exit 0
+      fi
+    - !reference [.kubernetes-snippets, check-namespace]
+    - INGRESS_STATUS=$((kubectl get ingress "${INGRESS_NAME}" -n "${KUBERNETES_NAMESPACE}" -o json 2>/dev/null || true) | jq ".metadata.name // empty" -r)
+    - >
+      if [ "${BLUE_DEPLOYMENT_STATUS}" == "false" ]; then
+        echo "Switching to blue deployment."
+        chmod +x ./.shell/edit-ingress-with-blue-green-yml.sh && ./.shell/edit-ingress-with-blue-green-yml.sh "blue"
+        yq eval ".metadata.annotations.\"bluegreen/live\" = \"true\"" -n > ./deployment-blue.yaml
+        yq eval ".metadata.annotations.\"bluegreen/live\" = \"false\"" -n > ./deployment-green.yaml
+        kubectl patch deployment ${DEPLOYMENT_BLUE_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-blue.yaml
+        kubectl patch deployment ${DEPLOYMENT_GREEN_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-green.yaml
+        kubectl apply -f ${INGRESS_FILE}
+      else
+        echo "Switching to green deployment."
+        chmod +x ./.shell/edit-ingress-with-blue-green-yml.sh && ./.shell/edit-ingress-with-blue-green-yml.sh "green"
+        yq eval ".metadata.annotations.\"bluegreen/live\" = \"false\"" -n > ./deployment-blue.yaml
+        yq eval ".metadata.annotations.\"bluegreen/live\" = \"true\"" -n > ./deployment-green.yaml
+        kubectl patch deployment ${DEPLOYMENT_BLUE_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-blue.yaml
+        kubectl patch deployment ${DEPLOYMENT_GREEN_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-green.yaml
+        kubectl apply -f ${INGRESS_FILE}
+      fi
+  environment:
+    name: production/main
+    url: https://${KUBERNETES_INGRESS_IP_ADDRESS}/production/
+
+kubernetes-deploy-development:
+  extends: .kubernetes-deploy-development-base
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+  stage: deploy
+  needs:
+    - docker-push-development
+  script:
+    - !reference [.kubernetes-snippets, check-namespace]
+    - chmod +x ./.shell/edit-deployment-yml.sh && ./.shell/edit-deployment-yml.sh
+    - chmod +x ./.shell/edit-service-yml.sh && ./.shell/edit-service-yml.sh
+    - chmod +x ./.shell/edit-ingress-yml.sh && ./.shell/edit-ingress-yml.sh
+    - kubectl apply -f ${DEPLOYMENT_FILE}
+    - kubectl apply -f ${SERVICE_FILE}
+    - kubectl apply -f ${INGRESS_FILE}
+  environment:
+    name: development/${CI_COMMIT_REF_SLUG}
+    url: https://${KUBERNETES_INGRESS_IP_ADDRESS}/${CI_COMMIT_REF_SLUG}/
+    on_stop: kubernetes-stop-development
+
+kubernetes-stop-development:
+  extends: .kubernetes-deploy-development-base
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+      when: manual
+  stage: deploy
+  script:
+    - kubectl delete deployment -n ${KUBERNETES_NAMESPACE} ${DEPLOYMENT_NAME}
+    - kubectl delete service -n ${KUBERNETES_NAMESPACE} ${SERVICE_NAME}
+    - kubectl delete ingress -n ${KUBERNETES_NAMESPACE} ${INGRESS_NAME}
+  environment:
+    name: development/${CI_COMMIT_REF_SLUG}
+    action: stop
+  variables:
+    GIT_STRATEGY: none
+
+kubernetes-get-contexts:
+  when: manual
+  stage: manual
+  script:
+    - kubectl config get-contexts
+  image:
+    name: alpine/k8s:1.27.9
+  tags:
+    - gitlab-org-docker
+
+kubernetes-create-docker-registry-secret:
+  extends: .kubernetes-base
+  when: manual
+  stage: manual
+  script:
+    - !reference [.kubernetes-snippets, check-namespace]
+    - > 
+      if [ -z ${KUBERNETES_NAMESPACE} ]; then
+        echo "Error: KUBERNETES_NAMESPACE variable is not provided."
+        exit 1 
+      elif [ -z ${SECRET_NAME} ]; then
+        echo "Error: SECRET_NAME variable is not provided."
+        exit 1
+      elif [ -z ${SECRET_CONFIG_BASE64} ]; then
+        echo "Error: SECRET_CONFIG_BASE64 variable is missing."
+        exit 1
+      fi
+    - >
+       yq eval -i "
+        .metadata.name = \"${SECRET_NAME}\" |
+        .metadata.namespace = \"${KUBERNETES_NAMESPACE}\" |
+        .data.\".dockerconfigjson\" = \"${SECRET_CONFIG_BASE64}\"
+       " ${SECRET_FILE}
+    - kubectl apply -f ${SECRET_FILE}
+  variables:
+    KUBERNETES_NAMESPACE: "" # Need to fill in manually on the webpage.
+    SECRET_FILE: "./.kubernetes/docker-registry-secret.template.yml"
+    SECRET_NAME: "" # Need to fill in manually on the webpage.
+    SECRET_CONFIG_BASE64: "" # Need to fill in manually on the webpage. (Base64-encoded)
+
+kubernetes-ingress-switch-blue-production:
+  extends: .kubernetes-deploy-production-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  stage: manual
+  script:
+    - !reference [.kubernetes-snippets, check-namespace]
+    - echo "Switching to blue deployment."
+    - chmod +x ./.shell/edit-ingress-with-blue-green-yml.sh && ./.shell/edit-ingress-with-blue-green-yml.sh "blue"
+    - yq eval ".metadata.annotations.\"bluegreen/live\" = \"true\"" -n > ./deployment-blue.yaml
+    - yq eval ".metadata.annotations.\"bluegreen/live\" = \"false\"" -n > ./deployment-green.yaml
+    - kubectl patch deployment ${DEPLOYMENT_BLUE_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-blue.yaml
+    - kubectl patch deployment ${DEPLOYMENT_GREEN_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-green.yaml
+    - kubectl apply -f ${INGRESS_FILE}
+
+kubernetes-ingress-switch-green-production:
+  extends: .kubernetes-deploy-production-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  stage: manual
+  script:
+    - !reference [.kubernetes-snippets, check-namespace]
+    - echo "Switching to green deployment."
+    - chmod +x ./.shell/edit-ingress-with-blue-green-yml.sh && ./.shell/edit-ingress-with-blue-green-yml.sh "green"
+    - yq eval ".metadata.annotations.\"bluegreen/live\" = \"false\"" -n > ./deployment-blue.yaml
+    - yq eval ".metadata.annotations.\"bluegreen/live\" = \"true\"" -n > ./deployment-green.yaml
+    - kubectl patch deployment ${DEPLOYMENT_BLUE_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-blue.yaml
+    - kubectl patch deployment ${DEPLOYMENT_GREEN_NAME} -n ${KUBERNETES_NAMESPACE} --patch-file ./deployment-green.yaml
+    - kubectl apply -f ${INGRESS_FILE}

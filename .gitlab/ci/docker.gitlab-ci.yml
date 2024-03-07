@@ -1,0 +1,45 @@
+.docker-base:
+  before_script:
+    - echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${DOCKER_REGISTRY}
+  image: docker:24.0.5-git
+  services:
+    - docker:24.0.5-dind
+  tags:
+    - gitlab-org-docker
+  variables:
+    DOCKER_REGISTRY: "<DOCKER_REGISTRY>" # Need to fill
+    DOCKER_REPO: "<DOCKER_REPO>" # Need to fill
+    DOCKER_IMAGE: "${DOCKER_REGISTRY}/${DOCKER_REPO}"
+
+docker-push-production:
+  extends: .docker-base
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  stage: release
+  needs:
+    - semantic-release
+  script:
+    - > 
+      if [ -z ${BUILD_VERSION} ]; then
+        echo "Environment variable BUILD_VERSION is null or empty. Do not continue execution"
+        exit 0
+      fi
+    - cd KubernetesTest
+    - docker build -t "${DOCKER_IMAGE}" -f Dockerfile ..
+    - DOCKER_IMAGE_ID=$(docker images -q "${DOCKER_IMAGE}")
+    - docker tag ${DOCKER_IMAGE_ID} ${DOCKER_IMAGE}:latest
+    - docker tag ${DOCKER_IMAGE_ID} ${DOCKER_IMAGE}:${BUILD_VERSION}
+    - docker push -a ${DOCKER_IMAGE}
+
+docker-push-development:
+  extends: .docker-base
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+  stage: release
+  needs: []
+  script:
+    - echo "CI_MERGE_REQUEST_ID->${CI_MERGE_REQUEST_ID}"
+    - docker build -t "${DOCKER_IMAGE}" -f ./KubernetesTest/Dockerfile ./KubernetesTest/..
+    - DOCKER_IMAGE_ID=$(docker images -q "${DOCKER_IMAGE}")
+    - docker tag ${DOCKER_IMAGE_ID} ${DOCKER_IMAGE}:${CI_COMMIT_REF_SLUG}-${CI_PIPELINE_IID}
+    - docker push "${DOCKER_IMAGE}:${CI_COMMIT_REF_SLUG}-${CI_PIPELINE_IID}"

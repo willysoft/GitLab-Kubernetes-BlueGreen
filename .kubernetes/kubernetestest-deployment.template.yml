@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: <name>
+  namespace: <namespace>
+spec:
+  replicas: <replicas>
+  selector:
+    matchLabels:
+      app: <selector-name>
+  template:
+    metadata:
+      labels:
+        app: <selector-name>
+    spec:
+      containers:
+        - name: <pod-name>
+          image:  <image>
+          ports:
+            - containerPort: 80
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: <env-value>
+            - name: PATH_BASE
+              value: <env-value>
+      imagePullSecrets:
+        - name: <docker-registry-secret>
