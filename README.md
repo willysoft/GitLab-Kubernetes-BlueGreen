@@ -82,6 +82,10 @@ This repository contains GitLab CI/CD configuration for continuous deployment of
 
 The configuration is split into reusable templates and job-specific settings. You'll need to fill in specific variables marked as `<VARIABLE_NAME>` before using these configurations.
 
+### Semantic Release Settings
+
+- `GITLAB_TOKEN` Your GitLab project access token for accessing the GitLab API.
+
 ### Docker Settings
 
 - `DOCKER_REGISTRY`: Your Docker registry URL.
